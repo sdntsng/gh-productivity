@@ -29,7 +29,9 @@ def create_weekly_trends(commits_df, start_date=None, end_date=None):
 
     df = df.copy()
     # Add week column (normalize to week start)
-    df.loc[:, 'week'] = df['date'].dt.to_period('W').dt.start_time
+    # Use date-only column to avoid tz boundary issues
+    base_col = 'date_day' if 'date_day' in df.columns else 'date'
+    df.loc[:, 'week'] = df[base_col].dt.to_period('W').dt.start_time
 
     # Weekly aggregation by developer
     weekly_stats = df.groupby(['author', 'week']).agg({
@@ -68,7 +70,8 @@ def filter_commits_by_period(commits_df, period='all'):
     if period == 'all':
         return commits_df
     
-    end_date = commits_df['date'].max()
+    base_col = 'date_day' if 'date_day' in commits_df.columns else 'date'
+    end_date = commits_df[base_col].max()
     
     if period == 'last_7_days':
         start_date = end_date - timedelta(days=7)
@@ -88,7 +91,7 @@ def filter_commits_by_period(commits_df, period='all'):
     else:
         return commits_df
     
-    return commits_df[commits_df['date'] >= start_date]
+    return commits_df[commits_df[base_col] >= start_date]
 
 def create_summary_cards(commits_df, prod_df):
     """Create summary statistics cards"""
@@ -99,7 +102,8 @@ def create_summary_cards(commits_df, prod_df):
     total_lines_added = commits_df['additions'].sum()
     total_lines_deleted = commits_df['deletions'].sum()
     
-    date_range = f"{commits_df['date'].min().strftime('%Y-%m-%d')} to {commits_df['date'].max().strftime('%Y-%m-%d')}" if not commits_df.empty else 'N/A'
+    base_col = 'date_day' if 'date_day' in commits_df.columns else 'date'
+    date_range = f"{commits_df[base_col].min().strftime('%Y-%m-%d')} to {commits_df[base_col].max().strftime('%Y-%m-%d')}" if not commits_df.empty else 'N/A'
     
     return {
         'total_commits': f"{total_commits:,}",
@@ -157,6 +161,8 @@ def _plot_table_from_df(df: pd.DataFrame, title: str) -> go.Figure:
         fig.update_layout(title=f"{title} - No Data Available")
         return fig
     
+    # Work on a copy to avoid SettingWithCopy warnings
+    df = df.copy()
     # Round floats for display
     for col in df.select_dtypes(include=['float']).columns:
         df[col] = df[col].round(2)
@@ -165,7 +171,7 @@ def _plot_table_from_df(df: pd.DataFrame, title: str) -> go.Figure:
     cell_colors = [['#ffffff'] * len(df) for _ in df.columns]
     
     # Color rate columns: green if >70, yellow 40-70, red <40
-    rate_cols = [col for col in df.columns if '_rate' in col]
+    rate_cols = [col for col in df.columns if isinstance(col, str) and '_rate' in col]
     for i, col in enumerate(df.columns):
         if col in rate_cols:
             for j, val in enumerate(df[col]):
@@ -176,7 +182,7 @@ def _plot_table_from_df(df: pd.DataFrame, title: str) -> go.Figure:
                 else:
                     cell_colors[i][j] = '#f8d7da'  # light red
     
-    header = dict(values=list(df.columns), fill_color='#667eea', align='left', font=dict(color='white', size=12))
+    header = dict(values=[str(c) for c in df.columns], fill_color='#667eea', align='left', font=dict(color='white', size=12))
     cells = dict(values=[df[col] for col in df.columns], fill_color=cell_colors, align='left')
     fig = go.Figure(data=[go.Table(header=header, cells=cells)])
     fig.update_layout(title=title, height=min(600, 80 + 24 * (len(df) + 1)))
@@ -301,7 +307,7 @@ def create_enhanced_charts(commits_core, prod_core, weekly_trends):
     # 7. Daily commits by developer
     if not commits_core.empty:
         _d = commits_core.copy()
-        _d.loc[:, 'date_only'] = _d['date'].dt.normalize()
+        _d.loc[:, 'date_only'] = _d['date_day'] if 'date_day' in _d.columns else _d['date'].dt.normalize()
         # Prepare full date range per developer
         date_min = _d['date_only'].min()
         date_max = _d['date_only'].max()
@@ -346,8 +352,38 @@ def create_enhanced_charts(commits_core, prod_core, weekly_trends):
         charts['daily_by_dev'] = go.Figure()
         charts['daily_by_dev'].update_layout(title='Daily Commits by Developer - No Data Available')
 
+    # 7b. Weekly commits by developer (grouped bars) and weekly pivot table matching Excel view
+    if not commits_core.empty:
+        _w = commits_core.copy()
+        base_dt = _w['date_day'] if 'date_day' in _w.columns else _w['date']
+        iso = base_dt.dt.isocalendar()
+        _w.loc[:, 'iso_year'] = iso['year'].astype(int)
+        _w.loc[:, 'week_num'] = iso['week'].astype(int)
+        weekly_counts = (
+            _w.groupby(['author', 'week_num'])['sha'].count().reset_index(name='commits')
+            .rename(columns={'author': 'developer'})
+        )
+        charts['weekly_by_dev_bar'] = px.bar(
+            weekly_counts,
+            x='week_num', y='commits', color='developer',
+            title='Weekly Commits by Developer (Grouped)',
+            labels={'week_num': 'WeekNum', 'commits': 'Commits'}
+        )
+        charts['weekly_by_dev_bar'].update_layout(barmode='group', hovermode='x unified')
+
+        # Weekly pivot table (Developer x WeekNum), plus Grand Total
+        pivot = weekly_counts.pivot_table(index='developer', columns='week_num', values='commits', aggfunc='sum', fill_value=0)
+        pivot['Grand Total'] = pivot.sum(axis=1)
+        cols = sorted([c for c in pivot.columns if c != 'Grand Total']) + ['Grand Total']
+        pivot = pivot[cols].reset_index()
+        charts['weekly_pivot_table'] = _plot_table_from_df(pivot, 'Weekly Commits Pivot (Developer x WeekNum)')
+    else:
+        charts['weekly_by_dev_bar'] = go.Figure(); charts['weekly_by_dev_bar'].update_layout(title='Weekly Commits by Developer - No Data Available')
+        charts['weekly_pivot_table'] = go.Figure(); charts['weekly_pivot_table'].update_layout(title='Weekly Commits Pivot - No Data Available')
+
     # 8. Repository activity heatmap (Top 10 repos)
-    repo_daily = commits_core.groupby([commits_core['date'].dt.date.rename('date'), 'repository']).size().reset_index(name='commits')
+    date_col = (commits_core['date_day'] if 'date_day' in commits_core.columns else commits_core['date'].dt.normalize())
+    repo_daily = commits_core.groupby([date_col.dt.date.rename('date'), 'repository']).size().reset_index(name='commits')
     top_repos = commits_core['repository'].value_counts().head(10).index.tolist()
     repo_daily_top = repo_daily[repo_daily['repository'].isin(top_repos)]
     if not repo_daily_top.empty:
@@ -408,7 +444,7 @@ def create_enhanced_charts(commits_core, prod_core, weekly_trends):
     dev_table_df = period_prod[['developer', 'total_commits', 'avg_quality_score', 'total_lines_added', 
                                 'total_lines_deleted', 'lines_changed', 'avg_lines_per_commit', 
                                 'issue_ref_rate', 'conventional_rate', 'hotfix_rate', 'merge_rate', 
-                                'revert_rate', 'breaking_rate', 'breaking_changes']]
+                                'revert_rate', 'breaking_rate']]
     dev_table_df = dev_table_df.sort_values('total_commits', ascending=False)
     charts['developer_summary_table'] = _plot_table_from_df(dev_table_df, 'Developer Performance Summary')
 
@@ -429,28 +465,28 @@ def create_enhanced_charts(commits_core, prod_core, weekly_trends):
     return charts
 
 def create_dashboard_html():
-    """Create the base HTML template for the dashboard"""
+    """Create the base HTML template for the dashboard with escaped curly braces for str.format()"""
     return '''<!DOCTYPE html>
 <html>
 <head>
     <title>GitHub Productivity Analytics Dashboard</title>
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
-        body { 
+        body {{ 
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; 
             margin: 0; 
             padding: 20px; 
             background-color: #f8f9fa;
-        }
-        .header { 
+        }}
+        .header {{ 
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white; 
             padding: 30px; 
             border-radius: 10px; 
             margin-bottom: 30px;
             text-align: center;
-        }
-        .tabs {
+        }}
+        .tabs {{
             display: flex;
             background: white;
             border-radius: 10px;
@@ -458,8 +494,8 @@ def create_dashboard_html():
             margin-bottom: 20px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
             flex-wrap: wrap;
-        }
-        .tab-button {
+        }}
+        .tab-button {{
             flex: 1;
             padding: 15px 20px;
             border: none;
@@ -469,70 +505,70 @@ def create_dashboard_html():
             font-weight: 500;
             transition: all 0.3s ease;
             min-width: 120px;
-        }
-        .tab-button.active {
+        }}
+        .tab-button.active {{
             background: #667eea;
             color: white;
-        }
-        .tab-button:hover {
+        }}
+        .tab-button:hover {{
             background: #e9ecef;
-        }
-        .tab-button.active:hover {
+        }}
+        .tab-button.active:hover {{
             background: #5a6fd8;
-        }
-        .tab-content {
+        }}
+        .tab-content {{
             display: none;
             background: white;
             border-radius: 10px;
             padding: 20px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        .tab-content.active {
+        }}
+        .tab-content.active {{
             display: block;
-        }
-        .summary-cards {
+        }}
+        .summary-cards {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
             gap: 20px;
             margin-bottom: 30px;
-        }
-        .summary-card {
+        }}
+        .summary-card {{
             background: white;
             padding: 20px;
             border-radius: 10px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
             text-align: center;
             border-left: 4px solid #667eea;
-        }
-        .summary-card .value {
+        }}
+        .summary-card .value {{
             font-size: 2em;
             font-weight: bold;
             color: #667eea;
             display: block;
-        }
-        .summary-card .label {
+        }}
+        .summary-card .label {{
             color: #6c757d;
             margin-top: 5px;
             font-size: 0.9em;
-        }
-        .chart-container {
+        }}
+        .chart-container {{
             background: white;
             margin-bottom: 30px;
             border-radius: 10px;
             padding: 20px;
             box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-        .grid-2 {
+        }}
+        .grid-2 {{
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 20px;
-        }
-        .grid-3 {
+        }}
+        .grid-3 {{
             display: grid;
             grid-template-columns: repeat(3, 1fr);
             gap: 20px;
-        }
-        .filters {
+        }}
+        .filters {{
             background: white;
             border-radius: 10px;
             padding: 12px 16px;
@@ -542,18 +578,18 @@ def create_dashboard_html():
             flex-wrap: wrap;
             align-items: center;
             gap: 12px;
-        }
-        .filters label {
+        }}
+        .filters label {{
             font-size: 0.9em;
             color: #495057;
             margin-right: 8px;
-        }
-        .chip-group {
+        }}
+        .chip-group {{
             display: flex;
             flex-wrap: wrap;
             gap: 8px;
-        }
-        .chip {
+        }}
+        .chip {{
             display: inline-flex;
             align-items: center;
             gap: 6px;
@@ -561,17 +597,17 @@ def create_dashboard_html():
             border-radius: 999px;
             padding: 6px 10px;
             font-size: 0.85em;
-        }
-        .chip input {
+        }}
+        .chip input {{
             accent-color: #667eea;
-        }
-        @media (max-width: 1200px) {
-            .grid-3 { grid-template-columns: 1fr 1fr; }
-        }
-        @media (max-width: 768px) {
-            .grid-2, .grid-3 { grid-template-columns: 1fr; }
-            .tabs { flex-direction: column; }
-        }
+        }}
+        @media (max-width: 1200px) {{
+            .grid-3 {{ grid-template-columns: 1fr 1fr; }}
+        }}
+        @media (max-width: 768px) {{
+            .grid-2, .grid-3 {{ grid-template-columns: 1fr; }}
+            .tabs {{ flex-direction: column; }}
+        }}
     </style>
 </head>
 <body>
@@ -588,43 +624,43 @@ def create_dashboard_html():
     {tab_contents}
     
     <script>
-    function openTab(evt, tabName) {
+    function openTab(evt, tabName) {{
         var i, tabcontent, tablinks;
         tabcontent = document.getElementsByClassName("tab-content");
-        for (i = 0; i < tabcontent.length; i++) {
+        for (i = 0; i < tabcontent.length; i++) {{
             tabcontent[i].classList.remove("active");
-        }
+        }}
         tablinks = document.getElementsByClassName("tab-button");
-        for (i = 0; i < tablinks.length; i++) {
+        for (i = 0; i < tablinks.length; i++) {{
             tablinks[i].classList.remove("active");
-        }
+        }}
         document.getElementById(tabName).classList.add("active");
         evt.currentTarget.classList.add("active");
         
         // Trigger Plotly relayout to handle responsive charts
-        setTimeout(function() {
+        setTimeout(function() {{
             window.dispatchEvent(new Event('resize'));
-        }, 100);
+        }}, 100);
 
         // Initialize developer filters on first activation
-        if (!window._devFilterInit) { window._devFilterInit = new Set(); }
-        if (!window._devFilterInit.has(tabName)) {
-            try { initDeveloperFilters(tabName); } catch (e) { console.warn(e); }
+        if (!window._devFilterInit) {{ window._devFilterInit = new Set(); }}
+        if (!window._devFilterInit.has(tabName)) {{
+            try {{ initDeveloperFilters(tabName); }} catch (e) {{ console.warn(e); }}
             window._devFilterInit.add(tabName);
-        }
-    }
+        }}
+    }}
     
     // Make charts responsive
-    window.addEventListener('resize', function() {
+    window.addEventListener('resize', function() {{
         var plotElements = document.querySelectorAll('.plotly-graph-div');
-        plotElements.forEach(function(element) {
-            if (element.style.display !== 'none') {
+        plotElements.forEach(function(element) {{
+            if (element.style.display !== 'none') {{
                 Plotly.Plots.resize(element);
-            }
-        });
-    });
+            }}
+        }});
+    }});
 
-    function initDeveloperFilters(tabId) {
+    function initDeveloperFilters(tabId) {{
         var dailyId = tabId + '-daily-by-dev';
         var dailyEl = document.getElementById(dailyId);
         if (!dailyEl || !dailyEl.data) return;
@@ -632,57 +668,58 @@ def create_dashboard_html():
         var container = document.getElementById(tabId + '-dev-filters');
         if (!container) return;
         container.innerHTML = '';
-        names.forEach(function(name) {
+        names.forEach(function(name) {{
             var chip = document.createElement('label');
             chip.className = 'chip';
             var cb = document.createElement('input');
             cb.type = 'checkbox';
             cb.value = name;
             cb.checked = true;
-            cb.addEventListener('change', function() { applyDeveloperFilter(tabId); });
+            cb.addEventListener('change', function() {{ applyDeveloperFilter(tabId); }});
             chip.appendChild(cb);
             var txt = document.createElement('span');
             txt.textContent = name;
             chip.appendChild(txt);
             container.appendChild(chip);
-        });
-    }
+        }});
+    }}
 
-    function getSelectedDevelopers(tabId) {
+    function getSelectedDevelopers(tabId) {{
         var container = document.getElementById(tabId + '-dev-filters');
         if (!container) return [];
         var cbs = container.querySelectorAll('input[type="checkbox"]');
         var selected = [];
-        cbs.forEach(function(cb) { if (cb.checked) selected.push(cb.value); });
+        cbs.forEach(function(cb) {{ if (cb.checked) selected.push(cb.value); }});
         return selected;
-    }
+    }}
 
-    function applyDeveloperFilter(tabId) {
+    function applyDeveloperFilter(tabId) {{
         var selected = new Set(getSelectedDevelopers(tabId));
         var chartIds = [
-            tabId + '-daily-by-dev', 
-            tabId + '-weekly-commits', 
-            tabId + '-weekly-quality', 
-            tabId + '-weekly-changes', 
-            tabId + '-weekly-conventional'
+            tabId + '-daily-by-dev',
+            tabId + '-weekly-commits',
+            tabId + '-weekly-quality',
+            tabId + '-weekly-changes',
+            tabId + '-weekly-conventional',
+            tabId + '-weekly-by-dev'
         ];
-        chartIds.forEach(function(cid) {
+        chartIds.forEach(function(cid) {{
             var el = document.getElementById(cid);
             if (!el || !el.data) return;
             var vis = (el.data || []).map(t => selected.has(t.name) ? true : 'legendonly');
-            vis.forEach(function(v, idx) {
-                try { Plotly.restyle(el, {visible: v}, [idx]); } catch (e) {}
-            });
-        });
-    }
+            vis.forEach(function(v, idx) {{
+                try {{ Plotly.restyle(el, {{visible: v}}, [idx]); }} catch (e) {{}}
+            }});
+        }});
+    }}
 
     // Initialize first tab filters on load
-    window.addEventListener('load', function() {
+    window.addEventListener('load', function() {{
         var active = document.querySelector('.tab-content.active');
-        if (active && active.id) {
-            try { initDeveloperFilters(active.id); } catch (e) { console.warn(e); }
-        }
-    });
+        if (active && active.id) {{
+            try {{ initDeveloperFilters(active.id); }} catch (e) {{ console.warn(e); }}
+        }}
+    }});
     </script>
 </body>
 </html>'''
@@ -713,6 +750,14 @@ def main(commits_csv: str = None, prod_csv: str = None, out_html: str = None):
             commits['date'] = commits['date'].dt.tz_localize(None)
         except Exception:
             pass
+    # Add a stable date-only column derived from raw string to avoid tz/normalize issues
+    try:
+        # Re-read the date column as string for robust slicing of the first 10 chars
+        commits_raw = pd.read_csv(commits_csv, dtype={'date': str})
+        commits['date_day'] = pd.to_datetime(commits_raw['date'].str.slice(0, 10), format='%Y-%m-%d', errors='coerce')
+    except Exception:
+        commits['date_day'] = commits['date'].dt.normalize()
+
     prod = pd.read_csv(prod_csv)
     
     # Filter to core team only (exclude external contributors)
