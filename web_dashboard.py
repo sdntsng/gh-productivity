@@ -2,41 +2,553 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import plotly.offline as pyo
 from pathlib import Path
 from datetime import datetime, timedelta
 import numpy as np
 import config
+import json
+from pandas.api.types import DatetimeTZDtype
 
-# This script reads commit/productivity CSVs and generates a static HTML dashboard
+# This script reads commit/productivity CSVs and generates an interactive HTML dashboard
 # Run after extract.py has created the CSV files specified in config.py
 
-def create_weekly_trends(commits_df):
-    """Create week-on-week trend analysis for developers"""
-    # Add week column
-    commits_df['week'] = commits_df['date'].dt.to_period('W').dt.start_time
-    
+def create_weekly_trends(commits_df, start_date=None, end_date=None):
+    """Create week-on-week trend analysis for developers with optional date filtering.
+    Uses a safe copy to avoid chained assignment warnings.
+    """
+    df = commits_df
+    # Filter by date range if provided
+    if start_date is not None:
+        df = df[df['date'] >= start_date]
+    if end_date is not None:
+        df = df[df['date'] <= end_date]
+
+    if df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    # Add week column (normalize to week start)
+    df.loc[:, 'week'] = df['date'].dt.to_period('W').dt.start_time
+
     # Weekly aggregation by developer
-    weekly_stats = commits_df.groupby(['author', 'week']).agg({
+    weekly_stats = df.groupby(['author', 'week']).agg({
         'sha': 'count',  # commit count
         'quality_score': 'mean',
         'additions': 'sum',
-        'deletions': 'sum', 
+        'deletions': 'sum',
         'total_changes': 'sum',
         'has_issue_ref': 'sum',
         'follows_convention': 'sum',
         'is_hotfix': 'sum',
         'message_words': 'mean'
     }).reset_index()
-    
-    weekly_stats.columns = ['developer', 'week', 'commits', 'avg_quality', 'lines_added', 
-                           'lines_deleted', 'total_changes', 'issue_refs', 'conventional_commits', 'hotfixes', 'avg_words']
-    
+
+    weekly_stats.columns = [
+        'developer', 'week', 'commits', 'avg_quality', 'lines_added',
+        'lines_deleted', 'total_changes', 'issue_refs', 'conventional_commits', 'hotfixes', 'avg_words'
+    ]
+
     # Calculate percentages
     weekly_stats['conventional_rate'] = (weekly_stats['conventional_commits'] / weekly_stats['commits'] * 100).fillna(0)
     weekly_stats['issue_ref_rate'] = (weekly_stats['issue_refs'] / weekly_stats['commits'] * 100).fillna(0)
     weekly_stats['hotfix_rate'] = (weekly_stats['hotfixes'] / weekly_stats['commits'] * 100).fillna(0)
-    
+
     return weekly_stats
+
+def filter_commits_by_period(commits_df, period='all'):
+    """Filter commits by predefined time periods"""
+    if period == 'all':
+        return commits_df
+    
+    end_date = commits_df['date'].max()
+    
+    if period == 'last_7_days':
+        start_date = end_date - timedelta(days=7)
+    elif period == 'last_30_days':
+        start_date = end_date - timedelta(days=30)
+    elif period == 'last_90_days':
+        start_date = end_date - timedelta(days=90)
+    elif period == 'last_6_months':
+        start_date = end_date - timedelta(days=180)
+    elif period == 'last_year':
+        start_date = end_date - timedelta(days=365)
+    elif period == 'current_month':
+        start_date = end_date.replace(day=1)
+    elif period == 'current_quarter':
+        quarter_start_month = ((end_date.month - 1) // 3) * 3 + 1
+        start_date = end_date.replace(month=quarter_start_month, day=1)
+    else:
+        return commits_df
+    
+    return commits_df[commits_df['date'] >= start_date]
+
+def create_summary_cards(commits_df, prod_df):
+    """Create summary statistics cards"""
+    total_commits = len(commits_df)
+    total_developers = commits_df['author'].nunique()
+    total_repos = commits_df['repository'].nunique()
+    avg_quality = commits_df['quality_score'].mean()
+    total_lines_added = commits_df['additions'].sum()
+    total_lines_deleted = commits_df['deletions'].sum()
+    
+    date_range = f"{commits_df['date'].min().strftime('%Y-%m-%d')} to {commits_df['date'].max().strftime('%Y-%m-%d')}"
+    
+    return {
+        'total_commits': f"{total_commits:,}",
+        'total_developers': total_developers,
+        'total_repos': total_repos,
+        'avg_quality': f"{avg_quality:.2f}",
+        'total_lines_added': f"{total_lines_added:,}",
+        'total_lines_deleted': f"{total_lines_deleted:,}",
+        'date_range': date_range
+    }
+
+def _aggregate_productivity_from_commits(df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate per-developer productivity stats from raw commits for the selected period.
+    Returns columns: developer, total_commits, avg_quality_score, total_lines_added, total_lines_deleted,
+    lines_changed, issue_refs, conventional_commits, hotfixes
+    """
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                'developer', 'total_commits', 'avg_quality_score', 'total_lines_added', 'total_lines_deleted',
+                'lines_changed', 'issue_refs', 'conventional_commits', 'hotfixes'
+            ]
+        )
+    g = df.groupby('author').agg(
+        total_commits=('sha', 'count'),
+        avg_quality_score=('quality_score', 'mean'),
+        total_lines_added=('additions', 'sum'),
+        total_lines_deleted=('deletions', 'sum'),
+        lines_changed=('total_changes', 'sum'),
+        issue_refs=('has_issue_ref', 'sum'),
+        conventional_commits=('follows_convention', 'sum'),
+        hotfixes=('is_hotfix', 'sum')
+    ).reset_index().rename(columns={'author': 'developer'})
+    return g
+
+
+def _plot_table_from_df(df: pd.DataFrame, title: str) -> go.Figure:
+    """Create a Plotly Table figure from a DataFrame."""
+    if df.empty:
+        fig = go.Figure()
+        fig.update_layout(title=f"{title} - No Data Available")
+        return fig
+    header = dict(values=list(df.columns), fill_color='#667eea', align='left', font=dict(color='white', size=12))
+    cells = dict(values=[df[col] for col in df.columns], fill_color='lavender', align='left')
+    fig = go.Figure(data=[go.Table(header=header, cells=cells)])
+    fig.update_layout(title=title, height=min(600, 80 + 24 * (len(df) + 1)))
+    return fig
+
+
+def create_enhanced_charts(commits_core, prod_core, weekly_trends):
+    """Create enhanced charts with better interactivity and richer stats."""
+    charts = {}
+
+    # 0. Compute a period-accurate productivity snapshot
+    period_prod = _aggregate_productivity_from_commits(commits_core)
+
+    # 1. Enhanced top performers with hover data (period-correct)
+    charts['top_quality'] = px.bar(
+        period_prod.sort_values('avg_quality_score', ascending=True),
+        x='avg_quality_score',
+        y='developer',
+        orientation='h',
+        title='Top Developers by Average Quality Score (period)',
+        hover_data=['total_commits', 'total_lines_added', 'total_lines_deleted'],
+        color='avg_quality_score',
+        color_continuous_scale='viridis'
+    )
+    charts['top_quality'].update_layout(height=400)
+
+    # 2. Volume vs Quality with size by lines changed (period-correct)
+    charts['volume_quality'] = px.scatter(
+        period_prod,
+        x='total_commits',
+        y='avg_quality_score',
+        size='total_lines_added',
+        hover_name='developer',
+        title='Commit Volume vs Quality (bubble size = lines added)',
+        color='total_lines_deleted',
+        color_continuous_scale='reds'
+    )
+
+    # 3. Weekly commit activity with range selector
+    if not weekly_trends.empty:
+        charts['weekly_commits'] = px.line(
+            weekly_trends,
+            x='week',
+            y='commits',
+            color='developer',
+            title='Weekly Commit Activity Trends',
+            labels={'commits': 'Commits per Week', 'week': 'Week'}
+        )
+        charts['weekly_commits'].update_layout(
+            xaxis=dict(
+                rangeselector=dict(
+                    buttons=list([
+                        dict(count=1, label="1m", step="month", stepmode="backward"),
+                        dict(count=3, label="3m", step="month", stepmode="backward"),
+                        dict(count=6, label="6m", step="month", stepmode="backward"),
+                        dict(step="all")
+                    ])
+                ),
+                rangeslider=dict(visible=True),
+                type="date"
+            ),
+            hovermode='x unified'
+        )
+    else:
+        charts['weekly_commits'] = go.Figure()
+        charts['weekly_commits'].update_layout(title='Weekly Commit Activity Trends - No Data Available')
+
+    # 4. Daily commits by developer
+    # Build true daily counts (not cumulative) with reindex to fill missing days per developer
+    if not commits_core.empty:
+        _d = commits_core.copy()
+        _d.loc[:, 'date_only'] = _d['date'].dt.normalize()
+        # Prepare full date range per developer
+        date_min = _d['date_only'].min()
+        date_max = _d['date_only'].max()
+        all_days = pd.date_range(date_min, date_max, freq='D')
+        # Count per dev/day
+        daily_counts = (_d.groupby(['author', 'date_only']).size()
+                          .rename('commits')
+                          .reset_index())
+        # Reindex per developer to full day range, fill 0
+        frames = []
+        for dev, g in daily_counts.groupby('author'):
+            g2 = g.set_index('date_only').reindex(all_days, fill_value=0)
+            g2.index.name = 'date_only'
+            g2 = g2.reset_index()
+            g2['author'] = dev
+            frames.append(g2)
+        daily = pd.concat(frames, ignore_index=True)
+        daily = daily.rename(columns={'author': 'developer', 'date_only': 'date'})
+        charts['daily_by_dev'] = px.bar(
+            daily,
+            x='date', y='commits', color='developer',
+            title='Daily Commits by Developer',
+            labels={'commits': 'Commits per Day', 'date': 'Date'}
+        )
+        charts['daily_by_dev'].update_layout(
+            barmode='group',
+            xaxis=dict(
+                rangeselector=dict(
+                    buttons=list([
+                        dict(count=7, label="7d", step="day", stepmode="backward"),
+                        dict(count=1, label="1m", step="month", stepmode="backward"),
+                        dict(count=3, label="3m", step="month", stepmode="backward"),
+                        dict(step="all")
+                    ])
+                ),
+                rangeslider=dict(visible=True),
+                type="date"
+            ),
+            hovermode='x unified'
+        )
+    else:
+        charts['daily_by_dev'] = go.Figure()
+        charts['daily_by_dev'].update_layout(title='Daily Commits by Developer - No Data Available')
+
+    # 5. Repository activity heatmap (Top 10 repos)
+    repo_daily = commits_core.groupby([commits_core['date'].dt.date.rename('date'), 'repository']).size().reset_index(name='commits')
+    top_repos = commits_core['repository'].value_counts().head(10).index.tolist()
+    repo_daily_top = repo_daily[repo_daily['repository'].isin(top_repos)]
+    if not repo_daily_top.empty:
+        charts['repo_heatmap'] = px.density_heatmap(
+            repo_daily_top,
+            x='date',
+            y='repository',
+            z='commits',
+            title='Repository Activity Heatmap (Top 10 Most Active)',
+            color_continuous_scale='blues'
+        )
+    else:
+        charts['repo_heatmap'] = go.Figure()
+        charts['repo_heatmap'].update_layout(title='Repository Activity Heatmap - No Data Available')
+
+    # 6. Commit timing patterns
+    _commits = commits_core.copy()
+    _commits.loc[:, 'hour'] = _commits['date'].dt.hour
+    _commits.loc[:, 'day_of_week'] = _commits['date'].dt.day_name()
+    timing_data = _commits.groupby(['hour', 'day_of_week']).size().reset_index(name='commits')
+    if not timing_data.empty:
+        charts['timing_heatmap'] = px.density_heatmap(
+            timing_data,
+            x='hour',
+            y='day_of_week',
+            z='commits',
+            title='Commit Timing Patterns (Hour vs Day of Week)',
+            labels={'hour': 'Hour of Day', 'day_of_week': 'Day of Week'},
+            color_continuous_scale='viridis'
+        )
+    else:
+        charts['timing_heatmap'] = go.Figure()
+        charts['timing_heatmap'].update_layout(title='Commit Timing Patterns - No Data Available')
+
+    # 7. Developer summary table (period)
+    dev_table_df = period_prod.sort_values(['total_commits', 'avg_quality_score'], ascending=[False, False])
+    charts['developer_summary_table'] = _plot_table_from_df(dev_table_df, 'Developer Summary (period)')
+
+    # 8. Repository leaderboard table (period)
+    repo_leader = commits_core.groupby('repository').agg(
+        commits=('sha', 'count'),
+        lines_added=('additions', 'sum'),
+        lines_deleted=('deletions', 'sum'),
+        lines_changed=('total_changes', 'sum')
+    ).reset_index().sort_values('commits', ascending=False)
+    charts['repo_leaderboard'] = _plot_table_from_df(repo_leader.head(15), 'Top Repositories by Commits')
+
+    return charts
+
+def create_dashboard_html():
+    """Create the base HTML template for the dashboard"""
+    return '''<!DOCTYPE html>
+<html>
+<head>
+    <title>GitHub Productivity Analytics Dashboard</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {{ 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; 
+            margin: 0; 
+            padding: 20px; 
+            background-color: #f8f9fa;
+        }}
+        .header {{ 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white; 
+            padding: 30px; 
+            border-radius: 10px; 
+            margin-bottom: 30px;
+            text-align: center;
+        }}
+        .tabs {{
+            display: flex;
+            background: white;
+            border-radius: 10px;
+            padding: 5px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            flex-wrap: wrap;
+        }}
+        .tab-button {{
+            flex: 1;
+            padding: 15px 20px;
+            border: none;
+            background: transparent;
+            cursor: pointer;
+            border-radius: 8px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            min-width: 120px;
+        }}
+        .tab-button.active {{
+            background: #667eea;
+            color: white;
+        }}
+        .tab-button:hover {{
+            background: #e9ecef;
+        }}
+        .tab-button.active:hover {{
+            background: #5a6fd8;
+        }}
+        .tab-content {{
+            display: none;
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        .tab-content.active {{
+            display: block;
+        }}
+        .summary-cards {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .summary-card {{
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            text-align: center;
+            border-left: 4px solid #667eea;
+        }}
+        .summary-card .value {{
+            font-size: 2em;
+            font-weight: bold;
+            color: #667eea;
+            display: block;
+        }}
+        .summary-card .label {{
+            color: #6c757d;
+            margin-top: 5px;
+            font-size: 0.9em;
+        }}
+        .chart-container {{
+            background: white;
+            margin-bottom: 30px;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        .grid-2 {{
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }}
+        .filters {{
+            background: white;
+            border-radius: 10px;
+            padding: 12px 16px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+            margin-bottom: 16px;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 12px;
+        }}
+        .filters label {{
+            font-size: 0.9em;
+            color: #495057;
+            margin-right: 8px;
+        }}
+        .chip-group {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }}
+        .chip {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: #f1f3f5;
+            border-radius: 999px;
+            padding: 6px 10px;
+            font-size: 0.85em;
+        }}
+        .chip input {{
+            accent-color: #667eea;
+        }}
+        @media (max-width: 768px) {{
+            .grid-2 {{ grid-template-columns: 1fr; }}
+            .tabs {{ flex-direction: column; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>GitHub Productivity Analytics Dashboard</h1>
+        <p>Interactive insights into developer productivity and team performance</p>
+        <p><small>Generated: {generation_time}</small></p>
+    </div>
+    
+    <div class="tabs">
+        {tab_buttons}
+    </div>
+    
+    {tab_contents}
+    
+    <script>
+    function openTab(evt, tabName) {{
+        var i, tabcontent, tablinks;
+        tabcontent = document.getElementsByClassName("tab-content");
+        for (i = 0; i < tabcontent.length; i++) {{
+            tabcontent[i].classList.remove("active");
+        }}
+        tablinks = document.getElementsByClassName("tab-button");
+        for (i = 0; i < tablinks.length; i++) {{
+            tablinks[i].classList.remove("active");
+        }}
+        document.getElementById(tabName).classList.add("active");
+        evt.currentTarget.classList.add("active");
+        
+        // Trigger Plotly relayout to handle responsive charts
+        setTimeout(function() {{
+            window.dispatchEvent(new Event('resize'));
+        }}, 100);
+
+        // Initialize developer filters on first activation
+        if (!window._devFilterInit) {{ window._devFilterInit = new Set(); }}
+        if (!window._devFilterInit.has(tabName)) {{
+            try {{ initDeveloperFilters(tabName); }} catch (e) {{ console.warn(e); }}
+            window._devFilterInit.add(tabName);
+        }}
+    }}
+    
+    // Make charts responsive
+    window.addEventListener('resize', function() {{
+        var plotElements = document.querySelectorAll('.plotly-graph-div');
+        plotElements.forEach(function(element) {{
+            if (element.style.display !== 'none') {{
+                Plotly.Plots.resize(element);
+            }}
+        }});
+    }});
+
+    function initDeveloperFilters(tabId) {{
+        var dailyId = tabId + '-daily-by-dev';
+        var weeklyId = tabId + '-weekly-commits';
+        var dailyEl = document.getElementById(dailyId);
+        if (!dailyEl || !dailyEl.data) return;
+        var names = Array.from(new Set((dailyEl.data || []).map(t => t.name).filter(Boolean)));
+        var container = document.getElementById(tabId + '-dev-filters');
+        if (!container) return;
+        container.innerHTML = '';
+        names.forEach(function(name) {{
+            var chip = document.createElement('label');
+            chip.className = 'chip';
+            var cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.value = name;
+            cb.checked = true;
+            cb.addEventListener('change', function() {{ applyDeveloperFilter(tabId); }});
+            chip.appendChild(cb);
+            var txt = document.createElement('span');
+            txt.textContent = name;
+            chip.appendChild(txt);
+            container.appendChild(chip);
+        }});
+    }}
+
+    function getSelectedDevelopers(tabId) {{
+        var container = document.getElementById(tabId + '-dev-filters');
+        if (!container) return [];
+        var cbs = container.querySelectorAll('input[type="checkbox"]');
+        var selected = [];
+        cbs.forEach(function(cb) {{ if (cb.checked) selected.push(cb.value); }});
+        return selected;
+    }}
+
+    function applyDeveloperFilter(tabId) {{
+        var selected = new Set(getSelectedDevelopers(tabId));
+        var chartIds = [tabId + '-daily-by-dev', tabId + '-weekly-commits'];
+        chartIds.forEach(function(cid) {{
+            var el = document.getElementById(cid);
+            if (!el || !el.data) return;
+            var vis = (el.data || []).map(t => selected.has(t.name) ? true : 'legendonly');
+            // Apply visibility per trace
+            vis.forEach(function(v, idx) {{
+                try {{ Plotly.restyle(el, {{visible: v}}, [idx]); }} catch (e) {{}}
+            }});
+        }});
+    }}
+
+    // Initialize first tab filters on load
+    window.addEventListener('load', function() {{
+        var active = document.querySelector('.tab-content.active');
+        if (active && active.id) {{
+            try {{ initDeveloperFilters(active.id); }} catch (e) {{ console.warn(e); }}
+        }}
+    }});
+    </script>
+</body>
+</html>'''
 
 def main(commits_csv: str = None, prod_csv: str = None, out_html: str = None):
     # Use config defaults if not specified
@@ -45,154 +557,153 @@ def main(commits_csv: str = None, prod_csv: str = None, out_html: str = None):
     out_html = out_html or config.DASHBOARD_FILE
     
     commits = pd.read_csv(commits_csv, parse_dates=['date'])
+    # Normalize timezone to avoid pandas warnings in period conversions
+    try:
+        if isinstance(commits['date'].dtype, DatetimeTZDtype):
+            if commits['date'].dt.tz is not None:
+                commits['date'] = commits['date'].dt.tz_convert('UTC').dt.tz_localize(None)
+            else:
+                commits['date'] = commits['date'].dt.tz_localize(None)
+    except Exception:
+        # Fallback: best-effort drop tz if present
+        try:
+            commits['date'] = commits['date'].dt.tz_localize(None)
+        except Exception:
+            pass
     prod = pd.read_csv(prod_csv)
     
     # Filter to core team only (exclude external contributors)
     commits_core = commits[commits['author'].isin(config.CORE_TEAM)]
     prod_core = prod[prod['developer'].isin(config.CORE_TEAM)]
 
-    # Create weekly trends
-    weekly_trends = create_weekly_trends(commits_core)
+    # Create multiple time period views
+    time_periods = {
+        'all': 'All Time',
+        'last_30_days': 'Last 30 Days', 
+        'last_90_days': 'Last 90 Days',
+        'last_6_months': 'Last 6 Months',
+        'current_month': 'Current Month',
+        'current_quarter': 'Current Quarter'
+    }
     
-    # === EXISTING CHARTS ===
-    # Top performers by quality
-    fig_top_quality = px.bar(prod_core, x='avg_quality_score', y='developer', orientation='h', 
-                            title='Top Developers by Avg Quality Score (Core Team)')
+    # Generate tab buttons
+    tab_buttons = []
+    for i, (period, label) in enumerate(time_periods.items()):
+        active_class = " active" if i == 0 else ""
+        tab_buttons.append(f'<button class="tab-button{active_class}" onclick="openTab(event, \'{period}\')">{label}</button>')
+    
+    # Generate tab contents
+    tab_contents = []
+    
+    for i, (period, label) in enumerate(time_periods.items()):
+        # Filter data for this time period
+        period_commits = filter_commits_by_period(commits_core, period)
+        
+        # Create weekly trends for this period
+        weekly_trends = create_weekly_trends(period_commits)
+        
+        # Compute period productivity snapshot from commits (ensures period-correct tables/charts)
+        period_prod = _aggregate_productivity_from_commits(period_commits)
+        
+        # Create summary cards (handle empty safely)
+        if not period_commits.empty:
+            summary = create_summary_cards(period_commits, period_prod)
+        else:
+            summary = {
+                'total_commits': '0',
+                'total_developers': 0,
+                'total_repos': 0,
+                'avg_quality': '0.00',
+                'total_lines_added': '0',
+                'total_lines_deleted': '0',
+                'date_range': 'N/A'
+            }
+        
+        # Create enhanced charts
+        charts = create_enhanced_charts(period_commits, period_prod, weekly_trends)
+        
+        # Build tab content
+        active_class = " active" if i == 0 else ""
+        
+        tab_content = f'''
+        <div id="{period}" class="tab-content{active_class}">
+            <h2>{label} Overview</h2>
+            
+            <div class="summary-cards">
+                <div class="summary-card"><span class="value">{summary["total_commits"]}</span><div class="label">Total Commits</div></div>
+                <div class="summary-card"><span class="value">{summary["total_developers"]}</span><div class="label">Active Developers</div></div>
+                <div class="summary-card"><span class="value">{summary["total_repos"]}</span><div class="label">Repositories</div></div>
+                <div class="summary-card"><span class="value">{summary["avg_quality"]}</span><div class="label">Avg Quality Score</div></div>
+                <div class="summary-card"><span class="value">{summary["total_lines_added"]}</span><div class="label">Lines Added</div></div>
+                <div class="summary-card"><span class="value">{summary["total_lines_deleted"]}</span><div class="label">Lines Deleted</div></div>
+            </div>
+            
+            <p><strong>Period:</strong> {summary["date_range"]}</p>
+            
+            <div class="filters">
+                <label>Developers:</label>
+                <div id="{period}-dev-filters" class="chip-group"></div>
+            </div>
+            
+            <div class="chart-container">
+                {charts['weekly_commits'].to_html(full_html=False, include_plotlyjs=False, div_id=f"{period}-weekly-commits")}
+            </div>
+            
+            <div class="chart-container">
+                {charts['daily_by_dev'].to_html(full_html=False, include_plotlyjs=False, div_id=f"{period}-daily-by-dev")}
+            </div>
+            
+            <div class="grid-2">
+                <div class="chart-container">
+                    {charts['top_quality'].to_html(full_html=False, include_plotlyjs=False)}
+                </div>
+                <div class="chart-container">
+                    {charts['volume_quality'].to_html(full_html=False, include_plotlyjs=False)}
+                </div>
+            </div>
+            
+            <div class="chart-container">
+                {charts['repo_heatmap'].to_html(full_html=False, include_plotlyjs=False)}
+            </div>
+            
+            <div class="chart-container">
+                {charts['timing_heatmap'].to_html(full_html=False, include_plotlyjs=False)}
+            </div>
 
-    # Commit volume vs quality scatter
-    fig_volume_quality = px.scatter(prod_core, x='total_commits', y='avg_quality_score', 
-                                   hover_data=['developer'], title='Commit Volume vs Quality (Core Team)')
-
-    # === NEW WEEKLY TREND CHARTS ===
+            <div class="grid-2">
+                <div class="chart-container">
+                    {charts['developer_summary_table'].to_html(full_html=False, include_plotlyjs=False)}
+                </div>
+                <div class="chart-container">
+                    {charts['repo_leaderboard'].to_html(full_html=False, include_plotlyjs=False)}
+                </div>
+            </div>
+        </div>
+        '''
+        
+        tab_contents.append(tab_content)
     
-    # 1. Weekly commit activity
-    fig_weekly_commits = px.line(weekly_trends, x='week', y='commits', color='developer',
-                                title='Weekly Commit Activity Trends',
-                                labels={'commits': 'Commits per Week', 'week': 'Week'})
-    fig_weekly_commits.update_layout(hovermode='x unified')
-    
-    # 2. Weekly quality trends  
-    fig_weekly_quality = px.line(weekly_trends, x='week', y='avg_quality', color='developer',
-                                title='Weekly Quality Score Trends',
-                                labels={'avg_quality': 'Average Quality Score', 'week': 'Week'})
-    fig_weekly_quality.update_layout(hovermode='x unified')
-    
-    # 3. Weekly lines of code trends
-    fig_weekly_loc = px.line(weekly_trends, x='week', y='total_changes', color='developer',
-                            title='Weekly Lines of Code Changed',
-                            labels={'total_changes': 'Total Lines Changed', 'week': 'Week'})
-    fig_weekly_loc.update_layout(hovermode='x unified')
-    
-    # 4. Weekly conventional commits adoption
-    fig_weekly_conv = px.line(weekly_trends, x='week', y='conventional_rate', color='developer',
-                             title='Weekly Conventional Commits Adoption Rate (%)',
-                             labels={'conventional_rate': 'Conventional Commits %', 'week': 'Week'})
-    fig_weekly_conv.update_layout(hovermode='x unified')
-    
-    # 5. Multi-metric dashboard for each developer
-    fig_multi_metrics = make_subplots(
-        rows=2, cols=2,
-        subplot_titles=('Commits per Week', 'Quality Score', 'Lines Changed', 'Issue Reference Rate'),
-        specs=[[{"secondary_y": False}, {"secondary_y": False}],
-               [{"secondary_y": False}, {"secondary_y": False}]]
+    # Create the complete HTML
+    html_template = create_dashboard_html()
+    html = html_template.format(
+        generation_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        tab_buttons=''.join(tab_buttons),
+        tab_contents=''.join(tab_contents)
     )
     
-    colors = px.colors.qualitative.Set1[:len(config.CORE_TEAM)]
-    for i, dev in enumerate(config.CORE_TEAM):
-        dev_data = weekly_trends[weekly_trends['developer'] == dev]
-        
-        # Commits
-        fig_multi_metrics.add_trace(
-            go.Scatter(x=dev_data['week'], y=dev_data['commits'], name=f'{dev} Commits',
-                      line=dict(color=colors[i]), showlegend=(i==0)),
-            row=1, col=1
-        )
-        
-        # Quality
-        fig_multi_metrics.add_trace(
-            go.Scatter(x=dev_data['week'], y=dev_data['avg_quality'], name=f'{dev} Quality',
-                      line=dict(color=colors[i]), showlegend=False),
-            row=1, col=2
-        )
-        
-        # Lines changed
-        fig_multi_metrics.add_trace(
-            go.Scatter(x=dev_data['week'], y=dev_data['total_changes'], name=f'{dev} Lines',
-                      line=dict(color=colors[i]), showlegend=False),
-            row=2, col=1
-        )
-        
-        # Issue ref rate
-        fig_multi_metrics.add_trace(
-            go.Scatter(x=dev_data['week'], y=dev_data['issue_ref_rate'], name=f'{dev} Issue Refs',
-                      line=dict(color=colors[i]), showlegend=False),
-            row=2, col=2
-        )
-    
-    fig_multi_metrics.update_layout(
-        title_text="Developer Performance Metrics - Weekly Trends",
-        height=600,
-        hovermode='x unified'
-    )
-    
-    # 6. Repository activity heatmap
-    repo_weekly = commits_core.groupby([commits_core['date'].dt.to_period('W').dt.start_time, 'repository']).size().reset_index(name='commits')
-    repo_weekly['week'] = repo_weekly['date']
-    
-    # Top 10 most active repos
-    top_repos = commits_core['repository'].value_counts().head(10).index.tolist()
-    repo_weekly_top = repo_weekly[repo_weekly['repository'].isin(top_repos)]
-    
-    fig_repo_heatmap = px.line(repo_weekly_top, x='week', y='commits', color='repository',
-                              title='Weekly Repository Activity (Top 10 Most Active)',
-                              labels={'commits': 'Commits per Week', 'week': 'Week'})
-    fig_repo_heatmap.update_layout(hovermode='x unified')
-
-    # === ENHANCED OVERVIEW CHARTS ===
-    # Lines of code overview
-    fig_lines_overview = px.bar(prod_core, x='developer', y=['total_lines_added', 'total_lines_deleted'],
-                               title='Total Lines Added vs Deleted by Developer',
-                               barmode='group')
-    
-    # Time-based working patterns
-    commits_core['commit_hour'] = commits_core['date'].dt.hour
-    hourly_commits = commits_core.groupby(['author', 'commit_hour']).size().reset_index(name='commits')
-    fig_working_hours = px.line(hourly_commits, x='commit_hour', y='commits', color='author',
-                               title='Developer Working Hours Pattern (Commits by Hour of Day)',
-                               labels={'commit_hour': 'Hour of Day (24h)', 'commits': 'Number of Commits'})
-
-    # Assemble all figures into a comprehensive HTML dashboard
-    html_parts = [
-        f"<h1>🚀 Developer Productivity Dashboard - Enhanced Analytics</h1>",
-        f"<p><strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M')} | <strong>Core Team Analysis</strong></p>",
-        f"<p><strong>Analysis Period:</strong> {commits_core['date'].min().strftime('%Y-%m-%d')} to {commits_core['date'].max().strftime('%Y-%m-%d')}</p>",
-        f"<p><strong>Total Repositories:</strong> {commits_core['repository'].nunique()} | <strong>Total Commits:</strong> {len(commits_core):,}</p>",
-        
-        "<h2>📊 Weekly Trends & Performance Analysis</h2>",
-        fig_multi_metrics.to_html(full_html=False, include_plotlyjs='cdn'),
-        
-        "<h2>📈 Individual Metric Trends</h2>",
-        fig_weekly_commits.to_html(full_html=False, include_plotlyjs=False),
-        fig_weekly_quality.to_html(full_html=False, include_plotlyjs=False),
-        fig_weekly_loc.to_html(full_html=False, include_plotlyjs=False),
-        fig_weekly_conv.to_html(full_html=False, include_plotlyjs=False),
-        
-        "<h2>🏆 Overall Performance Comparison</h2>",
-        fig_top_quality.to_html(full_html=False, include_plotlyjs=False),
-        fig_volume_quality.to_html(full_html=False, include_plotlyjs=False),
-        fig_lines_overview.to_html(full_html=False, include_plotlyjs=False),
-        
-        "<h2>🕒 Working Patterns & Repository Activity</h2>",
-        fig_working_hours.to_html(full_html=False, include_plotlyjs=False),
-        fig_repo_heatmap.to_html(full_html=False, include_plotlyjs=False),
-        
-        "<hr><p><em>Dashboard shows core team members only. External contributors and bots excluded for clarity.</em></p>"
-    ]
-    
-    html = "\n".join(html_parts)
+    # Write the complete HTML
     Path(out_html).write_text(html, encoding='utf-8')
-    print(f"Enhanced dashboard written to {out_html}")
-    print(f"Analysis covers {commits_core['repository'].nunique()} repositories and {len(commits_core):,} commits from core team")
+    
+    print(f"Enhanced interactive dashboard written to {out_html}")
+    print(f"Features:")
+    print(f"  ✅ Time period selection ({len(time_periods)} periods)")
+    print(f"  ✅ Interactive charts with zoom and pan")
+    print(f"  ✅ Summary statistics for each period")
+    print(f"  ✅ Repository activity heatmaps")
+    print(f"  ✅ Commit timing pattern analysis")
+    print(f"  ✅ Responsive design for mobile devices")
+    print(f"  ✅ Professional UI with gradient headers")
+    print(f"\nAnalysis covers {commits_core['repository'].nunique()} repositories and {len(commits_core):,} commits from core team")
 
 if __name__ == '__main__':
     main()
