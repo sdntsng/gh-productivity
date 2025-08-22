@@ -1,0 +1,66 @@
+{
+  "name": "github-productivity-analytics",
+  "version": "1.0.0",
+  "description": "Comprehensive GitHub organization analytics with interactive dashboards for tracking developer productivity, commit quality, and team performance metrics",
+  "keywords": [
+    "github",
+    "analytics", 
+    "productivity",
+    "developer-metrics",
+    "team-dashboard",
+    "git-analysis",
+    "commit-analysis", 
+    "code-metrics",
+    "github-api",
+    "plotly",
+    "data-visualization",
+    "developer-insights",
+    "team-productivity",
+    "github-stats",
+    "productivity-tracking",
+    "organization-analytics",
+    "repository-analysis",
+    "coding-metrics",
+    "development-analytics",
+    "team-performance"
+  ],
+  "homepage": "https://github.com/USER/REPO",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/USER/REPO.git"
+  },
+  "bugs": {
+    "url": "https://github.com/USER/REPO/issues"
+  },
+  "license": "MIT",
+  "author": "GitHub Productivity Analytics Contributors",
+  "main": "extract.py",
+  "scripts": {
+    "setup": "python setup.py",
+    "test": "python test_setup.py",
+    "extract": "python extract.py",
+    "dashboard": "python web_dashboard.py"
+  },
+  "engines": {
+    "python": ">=3.9"
+  },
+  "dependencies": {
+    "pandas": ">=2.0",
+    "requests": ">=2.31", 
+    "plotly": ">=5.0",
+    "matplotlib": ">=3.7",
+    "seaborn": ">=0.12"
+  },
+  "topics": [
+    "github-analytics",
+    "developer-productivity", 
+    "team-metrics",
+    "data-visualization",
+    "dashboard",
+    "git-analysis",
+    "commit-analysis",
+    "productivity-tracking",
+    "github-api",
+    "plotly"
+  ]
+}

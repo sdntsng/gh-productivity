@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "github-productivity-analytics"
+version = "1.0.0"
+description = "Comprehensive GitHub organization analytics with interactive dashboards for tracking developer productivity, commit quality, and team performance metrics"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "GitHub Productivity Analytics Contributors"}
+]
+maintainers = [
+    {name = "GitHub Productivity Analytics Contributors"}
+]
+keywords = [
+    "github", "analytics", "productivity", "developer-metrics", "team-dashboard", 
+    "git-analysis", "commit-analysis", "code-metrics", "github-api", "plotly",
+    "data-visualization", "developer-insights", "team-productivity", "github-stats",
+    "productivity-tracking", "organization-analytics", "repository-analysis"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10", 
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Topic :: Office/Business :: Financial :: Spreadsheet",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Topic :: System :: Monitoring"
+]
+requires-python = ">=3.9"
+dependencies = [
+    "pandas>=2.0",
+    "requests>=2.31",
+    "plotly>=5.0", 
+    "matplotlib>=3.7",
+    "seaborn>=0.12"
+]
+
+[project.urls]
+Homepage = "https://github.com/USER/REPO"
+Documentation = "https://github.com/USER/REPO#readme"
+Repository = "https://github.com/USER/REPO.git"
+"Bug Tracker" = "https://github.com/USER/REPO/issues"
+Changelog = "https://github.com/USER/REPO/releases"
+
+[project.scripts]
+gh-productivity-setup = "setup:main"
+gh-productivity-test = "test_setup:main"
+gh-productivity-extract = "extract:main"
+
+[tool.setuptools]
+packages = ["github_productivity_analytics"]
+
+[tool.setuptools.package-dir]
+github_productivity_analytics = "."
