@@ -61,8 +61,23 @@ COMMIT_ANALYSIS_FILE = "commit_analysis.csv"
 PRODUCTIVITY_FILE = "developer_productivity.csv"
 DASHBOARD_FILE = "productivity_dashboard.html"
 
+# LLM Analysis Settings
+GEMINI_API_KEY = ""  # Add your Gemini API key here
+GEMINI_MODEL = "gemini-pro"
+ENABLE_LLM_ANALYSIS = False     # Enable LLM-powered commit analysis
+LLM_BATCH_SIZE = 10            # Number of commits to analyze in one LLM call
+LLM_ANALYSIS_CACHE_DAYS = 7    # Days to cache LLM analysis results
+
 # Feature Flags
 ENABLE_DETAILED_STATS = True    # Fetch detailed commit statistics (lines added/deleted)
 ENABLE_QUALITY_ANALYSIS = True  # Perform commit message quality analysis
 ENABLE_AUTHOR_MAPPING = True    # Apply author name deduplication
 ENABLE_EXTERNAL_FILTERING = True # Filter out external contributors
+ENABLE_WEEKLY_TRENDS = True     # Generate week-on-week trend analysis
+ENABLE_WORKING_HOURS = True     # Analyze working hour patterns
+ENABLE_REPOSITORY_STATS = True  # Include repository-level statistics
+
+# Debugging & Logging
+DEBUG_MODE = False              # Enable verbose debugging output
+SHOW_REPO_LIST = True           # Print list of repositories being processed
+SHOW_PROGRESS = True            # Show progress during analysis

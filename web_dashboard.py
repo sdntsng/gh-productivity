@@ -352,31 +352,35 @@ def create_enhanced_charts(commits_core, prod_core, weekly_trends):
         charts['daily_by_dev'] = go.Figure()
         charts['daily_by_dev'].update_layout(title='Daily Commits by Developer - No Data Available')
 
-    # 7b. Weekly commits by developer (grouped bars) and weekly pivot table matching Excel view
+    # 7b. Weekly commits by developer (grouped bars) and weekly pivot table using week start dates
     if not commits_core.empty:
         _w = commits_core.copy()
         base_dt = _w['date_day'] if 'date_day' in _w.columns else _w['date']
-        iso = base_dt.dt.isocalendar()
-        _w.loc[:, 'iso_year'] = iso['year'].astype(int)
-        _w.loc[:, 'week_num'] = iso['week'].astype(int)
+        # Use the start of ISO week to avoid year/week collisions
+        _w = _w.assign(week_start=base_dt.dt.to_period('W').dt.start_time)
         weekly_counts = (
-            _w.groupby(['author', 'week_num'])['sha'].count().reset_index(name='commits')
-            .rename(columns={'author': 'developer'})
+            _w.groupby(['author', 'week_start'])['sha']
+              .count()
+              .reset_index(name='commits')
+              .rename(columns={'author': 'developer'})
         )
+
         charts['weekly_by_dev_bar'] = px.bar(
             weekly_counts,
-            x='week_num', y='commits', color='developer',
+            x='week_start', y='commits', color='developer',
             title='Weekly Commits by Developer (Grouped)',
-            labels={'week_num': 'WeekNum', 'commits': 'Commits'}
+            labels={'week_start': 'Week Start', 'commits': 'Commits'}
         )
-        charts['weekly_by_dev_bar'].update_layout(barmode='group', hovermode='x unified')
+        charts['weekly_by_dev_bar'].update_layout(barmode='group', hovermode='x unified', xaxis=dict(type='date'))
 
-        # Weekly pivot table (Developer x WeekNum), plus Grand Total
-        pivot = weekly_counts.pivot_table(index='developer', columns='week_num', values='commits', aggfunc='sum', fill_value=0)
+        # Weekly pivot table (Developer x Week Start), plus Grand Total
+        pivot = weekly_counts.pivot_table(index='developer', columns='week_start', values='commits', aggfunc='sum', fill_value=0)
         pivot['Grand Total'] = pivot.sum(axis=1)
-        cols = sorted([c for c in pivot.columns if c != 'Grand Total']) + ['Grand Total']
-        pivot = pivot[cols].reset_index()
-        charts['weekly_pivot_table'] = _plot_table_from_df(pivot, 'Weekly Commits Pivot (Developer x WeekNum)')
+        # Sort week_start columns chronologically, keep Grand Total at end
+        week_cols = [c for c in pivot.columns if c != 'Grand Total']
+        week_cols_sorted = sorted(week_cols)
+        pivot = pivot[week_cols_sorted + ['Grand Total']].reset_index()
+        charts['weekly_pivot_table'] = _plot_table_from_df(pivot, 'Weekly Commits Pivot (Developer x Week Start)')
     else:
         charts['weekly_by_dev_bar'] = go.Figure(); charts['weekly_by_dev_bar'].update_layout(title='Weekly Commits by Developer - No Data Available')
         charts['weekly_pivot_table'] = go.Figure(); charts['weekly_pivot_table'].update_layout(title='Weekly Commits Pivot - No Data Available')
@@ -463,6 +467,40 @@ def create_enhanced_charts(commits_core, prod_core, weekly_trends):
     charts['repo_leaderboard'] = _plot_table_from_df(repo_leader.head(15), 'Top Repositories Leaderboard')
 
     return charts
+
+def _export_debug_tables(commits_df: pd.DataFrame, prefix: str = '') -> None:
+    """Export daily and weekly counts and a weekly pivot to CSV for verification.
+    Files: debug_daily_counts{prefix}.csv, debug_weekly_counts{prefix}.csv, debug_weekly_pivot{prefix}.csv
+    """
+    if commits_df.empty:
+        return
+    base_dt = commits_df['date_day'] if 'date_day' in commits_df.columns else commits_df['date'].dt.normalize()
+    # Daily counts by developer
+    daily = (
+        commits_df.assign(date_only=base_dt)
+                  .groupby(['author', 'date_only'])
+                  .size()
+                  .reset_index(name='commits')
+                  .rename(columns={'author': 'developer'})
+    )
+    # Weekly counts by developer using week start dates
+    weekly = (
+        commits_df.assign(week_start=base_dt.dt.to_period('W').dt.start_time)
+                  .groupby(['author', 'week_start'])
+                  .size()
+                  .reset_index(name='commits')
+                  .rename(columns={'author': 'developer'})
+    )
+    # Weekly pivot
+    pivot = weekly.pivot_table(index='developer', columns='week_start', values='commits', aggfunc='sum', fill_value=0)
+    pivot['Grand Total'] = pivot.sum(axis=1)
+    week_cols = [c for c in pivot.columns if c != 'Grand Total']
+    pivot = pivot[sorted(week_cols) + ['Grand Total']].reset_index()
+    # Write files
+    suf = f"_{prefix}" if prefix else ''
+    daily.to_csv(f'debug_daily_counts{suf}.csv', index=False)
+    weekly.to_csv(f'debug_weekly_counts{suf}.csv', index=False)
+    pivot.to_csv(f'debug_weekly_pivot{suf}.csv', index=False)
 
 def create_dashboard_html():
     """Create the base HTML template for the dashboard with escaped curly braces for str.format()"""
@@ -798,6 +836,13 @@ def main(commits_csv: str = None, prod_csv: str = None, out_html: str = None):
         
         # Create enhanced charts
         charts = create_enhanced_charts(period_commits, period_prod, weekly_trends)
+
+        # Export debug tables for All Time once for verification
+        if i == 0:
+            try:
+                _export_debug_tables(period_commits, prefix='all')
+            except Exception as e:
+                print(f"[warn] Failed to export debug tables: {e}")
         
         # Build tab content
         active_class = " active" if i == 0 else ""
